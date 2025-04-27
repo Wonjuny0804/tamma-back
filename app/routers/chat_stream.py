@@ -1,90 +1,113 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
 from openai import OpenAI
 from app.config import OPENAI_API_KEY
-from app.deps import get_current_user
 from app.supabase import supabase
+from pydantic import BaseModel
+from langchain_core.messages import AIMessage, HumanMessage
+from app.routers.chat_history import Message
+from app.langgraph.nodes import agent_node
+import json
+from app.services.helper import extract_text_from_tool_content, reconstruct_tool_call
+
+from rich import print as rprint, pretty
+pretty.install(indent_guides=True) 
+
 
 router = APIRouter()
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-@router.get("/chat-stream")
-async def chat_stream(message: str, session_id: str, user_id: str = Depends(get_current_user)):
-    async def event_generator():
-        assistant_text = ""
 
-        # 1) Fetch existing history from Supabase
-        try:
-            history_resp = (
-                supabase
-                .table("chat_messages")
-                .select("role, content")
-                .eq("session_id", session_id)
-                .eq("user_id",    user_id)
-                .order("created_at", desc=False)
-                .execute()
-            )
-            history = history_resp.data  # List[{"role": "...", "content": "..."}]
-        except Exception as e:
-            yield f"data: [ERROR] failed to load history: {e}\n\n"
-            return
+class ChatRequest(BaseModel):
+    user_id: str
+    session_id: str
+    messages: list[Message]
 
-        # persist the conversation using service role (bypasses RLS)
-        try:
-            supabase.table("chat_messages").insert({
-                "session_id": session_id,
-                "user_id": user_id,
-                "role": "user",
-                "content": message,
-        }).execute()
-        except Exception as e:
-            yield f"data: [ERROR] failed to save user message: {str(e)}\n\n"
-            return
-        
-        # 3) Build the full list of messages for OpenAI, including system prompt
-        openai_msgs = [
-            {"role": "system", "content": "You're an AI assistant that helps users build software features."},
-        ]
-        # replay every historic turn
-        for m in history:
-            openai_msgs.append({"role": m["role"], "content": m["content"]})
-        # then add this new user turn
-        openai_msgs.append({"role": "user", "content": message})
 
-        stream = client.chat.completions.create(
-            model="gpt-4o-mini",
-            stream=True,
-            messages=openai_msgs
-        )
+@router.post("/chat-stream")
+async def chat(req: ChatRequest):
+    history = [ HumanMessage(content=m.content) if m.role=="user" else AIMessage(content=m.content)
+                for m in req.messages ]
 
-        try:
-            for chunk in stream:
-                content = chunk.choices[0].delta.content
-                if not content:
+    async def generate():
+        final_answer = None
+        tool_call_buffers = {}
+
+        async for mode, message in agent_node.astream(
+            input={"messages": history},
+            config={"configurable": {"thread_id": req.user_id}},
+            stream_mode=["messages", "updates"]
+        ):
+            if mode == 'messages':
+                message_chunk = message[0]
+                meta_data = message[1]
+
+                # 1. Handle tool call chunks
+                if hasattr(message_chunk, "tool_call_chunks") and message_chunk.tool_call_chunks:
+                    for tool_call_chunk in message_chunk.tool_call_chunks:
+                        tool_call_id = tool_call_chunk.get("id")
+                        tool_name = tool_call_chunk.get("name") or ""
+                        args_piece = tool_call_chunk.get("args") or ""
+
+                        if tool_call_id:
+                            if tool_call_id not in tool_call_buffers:
+                                tool_call_buffers[tool_call_id] = {
+                                    "id": tool_call_id,
+                                    "name": tool_name,
+                                    "args": args_piece,
+                                }
+                            else:
+                                tool_call_buffers[tool_call_id]["args"] += args_piece
+                            
+                            payload = {
+                                'role': 'tool',
+                                'content': tool_call_buffers[tool_call_id]['args'],
+                                'tool_call_id': tool_call_id,
+                                'tool_name': tool_name,
+                                'type': 'tool_message_stream'
+                            }
+                            yield f"data: {json.dumps(payload)} \n\n"
                     continue
 
-                assistant_text += content
-                lines = content.split("\n")
+                if message_chunk.__class__.__name__ == "ToolMessage":
+                    # ✅ This is the tool's response after execution
+                    content = extract_text_from_tool_content(message_chunk.content)
+                    tool_payload = {
+                        "role": "tool",
+                        "content": content,
+                        "tool_call_id": message_chunk.tool_call_id,
+                        "tool_name": message_chunk.name,
+                        "type": "tool_message_result"
+                    }
+                    yield f"data: {json.dumps(tool_payload)}\n\n"
+                    continue
 
-                for line in lines:
-                    yield f"data: {line}\n"
+                # 2. Handle finalizing tool call
+                if getattr(message_chunk.response_metadata, "finish_reason", None) == "tool_calls":
+                    for tool_call_id, tool_call_data in tool_call_buffers.items():
+                        payload = {
+                            'role': 'tool',
+                            'content': tool_call_data['args'],
+                            'tool_call_id': tool_call_data['id'],
+                            'tool_name': tool_call_data['name'],
+                            'type': 'tool_message_done'
+                        }
+                        yield f"data: {json.dumps(payload)}\n\n"
+                    tool_call_buffers.clear()
+                    continue
 
-                yield "\n"
-
-        except Exception as e:
-            yield f"data: [ERROR] streaming failed: {str(e)}\n\n"
-
+                # 3. Handle normal assistant content
+                if hasattr(message_chunk, "content") and message_chunk.content:
+                    payload = {
+                        "type": "answer",
+                        "content": message_chunk.content,
+                        "role": "assistant"
+                    }
+                    yield f"data: {json.dumps(payload)}\n\n"
+                    continue
+            elif mode == 'updates':
+                continue
         yield "data: [DONE]\n\n"
 
-        try:
-            supabase.table("chat_messages").insert({
-                "session_id": session_id,
-                "user_id": user_id,
-                "role": "assistant",
-                "content": assistant_text,
-            }).execute()
-        except Exception as e:
-            yield f"data: [ERROR] failed to save assistant message: {str(e)}\n\n"
-            return
 
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+    return StreamingResponse(generate(), media_type="text/event-stream")
